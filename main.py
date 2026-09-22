@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torchvision import transforms
 from models import make_model, DualBranchDiscriminator
 from channel_attacks import build_attack, ATTACK_REGISTRY
+from secure_channel import SecureLatentLink, REPLAY_MODES, TAMPER_POLICIES
 from criteria.lpips import lpips
 from collections import OrderedDict
 from torch import nn
@@ -294,6 +295,33 @@ if __name__ == '__main__':
         help='[interleave] RNG seed for the permutation. '
              'Use -1 for a fresh random permutation each forward pass.'
     )
+
+    # ------------------------------------------------------------------ #
+    # Secure transmission (Cifrar) arguments                               #
+    # ------------------------------------------------------------------ #
+    parser.add_argument(
+        '--encrypt', type=parse_boolean, default=False,
+        help='Send the final latent through the Cifrar secure link '
+             '(quantise -> encrypt -> BPSK -> AWGN -> attack -> decrypt).'
+    )
+    parser.add_argument(
+        '--cipher_seed', type=int, default=42,
+        help='[encrypt] Shared secret seed for Cifrar.'
+    )
+    parser.add_argument(
+        '--quant_bits', type=int, default=8, choices=[8, 16],
+        help='[encrypt] Latent quantisation resolution before encryption.'
+    )
+    parser.add_argument(
+        '--on_tamper', type=str, default='drop', choices=list(TAMPER_POLICIES),
+        help='[encrypt] drop: replace packets that fail the integrity check '
+             'with an all-zero latent. keep: decode them anyway.'
+    )
+    parser.add_argument(
+        '--replay_check', type=str, default='strict', choices=list(REPLAY_MODES),
+        help='[encrypt] Sequence-number freshness check. strict: seq must match '
+             'the receiver slot. monotonic: seq must increase. off: none.'
+    )
     # seed
     torch.manual_seed(42)
     random.seed(42)
@@ -302,7 +330,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     
-    args.outdir = os.path.join(args.outdir, f"{args.snr_db}dB", args.attack)
+    run_name = args.attack + ("_cifrar" if args.encrypt else "")
+    args.outdir = os.path.join(args.outdir, f"{args.snr_db}dB", run_name)
     if os.path.exists(args.outdir):
         shutil.rmtree(args.outdir)
     os.makedirs(os.path.join(args.outdir, 'recon'), exist_ok=True)
@@ -317,6 +346,7 @@ if __name__ == '__main__':
 
     # init logger
     t = time.strftime("%m_%d_%H:%M:%S", time.localtime())
+    os.makedirs("results/log", exist_ok=True)
     logger = get_logger(
         f"results/log/{t}-{args.snr_db}db.log")
     logger.info(args)
@@ -346,6 +376,23 @@ if __name__ == '__main__':
     attack.cuda()
     logger.info(f"Channel attack: {attack}")
 
+    # Secure link (Cifrar). The cipher is not differentiable, so it wraps only
+    # the final transmission; optimize_latent keeps the analog channel as its
+    # surrogate. The link gets its own attack instance because stateful attacks
+    # (replay buffer, interleave permutation) fill up with analog latents
+    # during optimisation.
+    secure_link = None
+    if args.encrypt:
+        secure_link = SecureLatentLink(
+            seed=args.cipher_seed,
+            quant_bits=args.quant_bits,
+            on_tamper=args.on_tamper,
+            replay_check=args.replay_check,
+        )
+        link_attack = build_attack(args)
+        link_attack.cuda()
+        logger.info(f"Secure link: {secure_link}")
+
     
     transform = get_transformation(args)
     psnrs = []
@@ -371,8 +418,15 @@ if __name__ == '__main__':
         latent_path, noises = optimize_latent(
             args, g_ema, images, images.shape[0], attack)
         with torch.no_grad():
-            transmitted = channel(p_norm(latent_path[-1], dim=(1, 2)))
-            received   = attack(transmitted)   # apply channel attack
+            tx_latent = p_norm(latent_path[-1], dim=(1, 2))
+            if secure_link is not None:
+                # quantise -> encrypt -> BPSK -> AWGN -> attack -> decrypt
+                received, reports = secure_link(tx_latent, channel, link_attack)
+                for i, rep in enumerate(reports):
+                    logger.info(f"[cifrar] {os.path.basename(path[i])}: {rep}")
+            else:
+                transmitted = channel(tx_latent)
+                received   = attack(transmitted)   # apply channel attack
             img_gen, _ = g_ema([received], input_is_latent=True,
                                randomize_noise=False, noise=None)
             lpips_img = calc_lpips_loss(img_gen, target_img_tensor)
@@ -392,4 +446,6 @@ if __name__ == '__main__':
     logger.info(f"Avg PSNR: {iter_psnr.avg}")
     logger.info(f"Avg MS-SSIM: {iter_msssim.avg}")
     logger.info(f"Avg Lpips: {iter_lpips.avg}")
+    if secure_link is not None:
+        logger.info(f"Secure link summary: {secure_link.stats}")
 

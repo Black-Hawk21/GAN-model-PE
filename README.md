@@ -48,6 +48,40 @@ python main.py --ckpt pretrained/CelebAMask-HQ-512x512.pt --outdir results/inver
 
 Make sure to adjust the arguments based on your requirements. You can find a description of the available arguments in the script.
 
+## Secure Transmission (Cifrar)
+
+The final latent can be sent through the Cifrar (Enc3) bit-level encryption and tamper-detection layer. The cipher lives in `cifrar.py` (unchanged, see [CIFRAR.md](CIFRAR.md)). `secure_channel.py` is the call-based bridge. `main.py` and `evaluate.py` only call it.
+
+```bash
+python main.py --ckpt pretrained/CelebAMask-HQ-512x512.pt --snr_db 15 --encrypt true
+python evaluate.py --snr_list 10 13 14 15 20 --encrypt true --attack replay
+```
+
+Each image is sent as one packet:
+
+```
+latent -> quantise -> [header: seq, range | payload] -> Cifrar.encrypt -> BPSK
+       -> AWGN -> channel attack -> hard decision -> Cifrar.decrypt
+       -> integrity / header / replay checks -> dequantise -> generator
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--encrypt` | `false` | Turn the secure link on |
+| `--cipher_seed` | `42` | Shared secret |
+| `--quant_bits` | `8` | Latent quantisation (8 or 16 bit) |
+| `--on_tamper` | `drop` | `drop`: packets that fail the integrity check become an all-zero latent. `keep`: decode them anyway |
+| `--replay_check` | `strict` | Sequence-number check: `strict` (seq must match the receiver slot), `monotonic`, or `off` (plain Cifrar, replays pass) |
+
+Things to know:
+
+- The cipher is not differentiable, so the latent optimisation still runs through the analog channel. Only the final transmission is encrypted.
+- Encrypted runs are saved under `<attack>_cifrar`, so they never overwrite unencrypted results.
+- One image costs about 1.3 M BPSK symbols (vs 14,336 analog channel uses) and about 4 s of CPU time for encrypt + decrypt.
+- There is no error-correcting code, so any bit error fails the integrity check. Rejection goes from 0% at 15 dB to 100% at 13 dB.
+- `evaluate.py` adds `reject_rate`, `tamper_rate`, `replay_rate`, `link_ber` and `channel_uses` columns, plus `security_vs_snr.png`.
+- Tests (CPU, no checkpoint needed): `python test_secure_channel.py`. Add `--full` for the SNR sweep at real latent size.
+
 ## Results
 ![Reconstructed Images](results/vis.png)
 The results, including reconstructed images and log files, will be saved in the specified output directory (`--outdir`). Check the log files for average PSNR, MS-SSIM, and LPIPS.

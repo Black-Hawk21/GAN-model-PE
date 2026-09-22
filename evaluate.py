@@ -24,6 +24,10 @@ Usage
         --snr_step    5 \\
         --attack      none
 
+Add ``--encrypt true`` to send each image through the Cifrar secure link
+(quantise -> encrypt -> BPSK -> AWGN -> attack -> decrypt).  Extra columns
+are then written: reject_rate, tamper_rate, replay_rate, link_ber, channel_uses.
+
 Run `python evaluate.py --help` for a full list of arguments.
 """
 
@@ -53,6 +57,7 @@ from tqdm import tqdm
 # ── project imports ────────────────────────────────────────────────────────────
 from models import make_model
 from channel_attacks import build_attack, ATTACK_REGISTRY
+from secure_channel import SecureLatentLink, REPLAY_MODES, TAMPER_POLICIES
 from criteria.lpips import lpips as lpips_module
 
 # optional – graceful fallback
@@ -326,15 +331,24 @@ def evaluate_snr_point(
     device: str,
     snr_db: float,
     out_img_dir: Path,
+    secure_link: SecureLatentLink = None,
+    link_attack: nn.Module = None,
 ) -> Dict[str, float]:
     """
     Evaluate all images at a given SNR level.
 
+    If ``secure_link`` is given, the final transmission goes through Cifrar
+    (the latent optimisation still uses the analog channel as its surrogate).
+
     Returns
     -------
     dict with keys: psnr, ssim, ber, spectral_eff, effective_se
+    (+ reject_rate, tamper_rate, replay_rate, link_ber, channel_uses
+    when encryption is on)
     """
     channel.change_snr(snr_db)
+    if secure_link is not None:
+        secure_link.reset_stats()
 
     psnr_acc, ssim_acc, ber_acc, se_acc, eff_acc = [], [], [], [], []
     image_pixels = args.size * args.size * 3   # H × W × C
@@ -353,7 +367,12 @@ def evaluate_snr_point(
         with torch.no_grad():
             # Forward pass through channel
             tx = p_norm(latent_opt, dim=(1, 2))
-            rx = attack(channel(tx))
+            if secure_link is not None:
+                rx, reports = secure_link(tx, channel, link_attack)
+                channel_uses = float(np.mean([r.channel_uses for r in reports]))
+            else:
+                rx = attack(channel(tx))
+                channel_uses = int(tx.reshape(tx.shape[0], -1).shape[1])
 
             # Decode
             img_gen, _ = g_ema([rx], input_is_latent=True,
@@ -368,11 +387,16 @@ def evaluate_snr_point(
             ssim_acc.append(compute_ssim(ref_01, hyp_01))
 
             # Channel / communication metrics
-            ber_acc.append(compute_ber(tx, rx))
+            if secure_link is not None:
+                # Each packet is quantised on its own min/max grid; a batch-wide
+                # grid would count re-quantisation rounding as bit errors.
+                ber_acc.append(float(np.mean([compute_ber(t, r) for t, r in zip(tx, rx)])))
+            else:
+                ber_acc.append(compute_ber(tx, rx))
             se_acc.append(compute_spectral_efficiency(snr_db))
 
-            latent_dim = int(tx.reshape(tx.shape[0], -1).shape[1])
-            eff_acc.append(compute_effective_se(tx, rx, snr_db, latent_dim, image_pixels))
+            # channel_uses = latent dims (analog) or BPSK symbols (encrypted)
+            eff_acc.append(compute_effective_se(tx, rx, snr_db, channel_uses, image_pixels))
 
             # Save reconstructed images
             imgs_np = (hyp_01.permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
@@ -380,13 +404,21 @@ def evaluate_snr_point(
                 fname = Path(paths[i]).name
                 Image.fromarray(arr).save(out_img_dir / fname)
 
-    return {
+    metrics = {
         "psnr":         float(np.mean(psnr_acc)),
         "ssim":         float(np.mean(ssim_acc)),
         "ber":          float(np.mean(ber_acc)),
         "spectral_eff": float(np.mean(se_acc)),
         "effective_se": float(np.mean(eff_acc)),
     }
+    if secure_link is not None:
+        link = secure_link.stats.summary()
+        for key in SECURITY_KEYS:
+            metrics[key] = float(link[key])
+    return metrics
+
+
+SECURITY_KEYS = ["reject_rate", "tamper_rate", "replay_rate", "link_ber", "channel_uses"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -493,6 +525,29 @@ def plot_combined(snr_list, results, out_dir, attack_name):
     _savefig(fig, out_dir / "combined_metrics.png")
 
 
+def plot_security_vs_snr(snr_list, results, out_dir, attack_name):
+    """Cifrar link: packet rejection and raw ciphertext BER vs SNR."""
+    rej = [r["reject_rate"] for r in results]
+    tam = [r["tamper_rate"] for r in results]
+    ber = [r["link_ber"] if r["link_ber"] > 0 else np.nan for r in results]  # log axis
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    ax1.plot(snr_list, rej, color=_C[1], **_S, label="Rejected packets")
+    ax1.plot(snr_list, tam, color=_C[0], **_S, linestyle="--", label="Integrity failures")
+    ax1.set(xlabel="SNR (dB)", ylabel="Fraction of images", ylim=(-0.05, 1.05),
+            title=f"Cifrar packet outcome  [attack: {attack_name}]")
+    ax1.grid(True, linestyle="--", alpha=0.45)
+    ax1.legend(fontsize=10)
+
+    ax2.semilogy(snr_list, ber, color=_C[4], **_S, label="Ciphertext BER (BPSK)")
+    ax2.set(xlabel="SNR (dB)", ylabel="BER (log scale)",
+            title="Raw link BER before decryption")
+    ax2.grid(True, which="both", linestyle="--", alpha=0.45)
+    ax2.legend(fontsize=10)
+    fig.tight_layout()
+    _savefig(fig, out_dir / "security_vs_snr.png")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Argument parser
 # ══════════════════════════════════════════════════════════════════════════════
@@ -547,6 +602,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rician_k",        type=float, default=1.0)
     p.add_argument("--null_ratio",      type=float, default=0.3)
     p.add_argument("--interleave_seed", type=int,   default=0)
+    # ── secure transmission (Cifrar) ─────────────────────────────────────────
+    p.add_argument("--encrypt",      type=parse_bool, default=False,
+                   help="Send the final latent through the Cifrar secure link.")
+    p.add_argument("--cipher_seed",  type=int, default=42,
+                   help="Shared secret seed for Cifrar.")
+    p.add_argument("--quant_bits",   type=int, default=8, choices=[8, 16],
+                   help="Latent quantisation resolution before encryption.")
+    p.add_argument("--on_tamper",    type=str, default="drop",
+                   choices=list(TAMPER_POLICIES),
+                   help="drop: zero latent for packets failing the integrity check; "
+                        "keep: decode them anyway.")
+    p.add_argument("--replay_check", type=str, default="strict",
+                   choices=list(REPLAY_MODES),
+                   help="Sequence-number freshness check.")
     # ── misc ─────────────────────────────────────────────────────────────────
     p.add_argument("--device",     type=str, default="cuda",
                    help="Compute device: 'cuda' or 'cpu'.")
@@ -573,7 +642,8 @@ def main():
 
     # ── output directory ──────────────────────────────────────────────────────
     ts      = time.strftime("%Y%m%d_%H%M%S")
-    out_dir = Path(args.results_dir) / f"eval_{ts}_{args.attack}"
+    run_name = args.attack + ("_cifrar" if args.encrypt else "")
+    out_dir = Path(args.results_dir) / f"eval_{ts}_{run_name}"
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n[eval] Results will be saved to: {out_dir}\n")
 
@@ -619,6 +689,17 @@ def main():
     attack  = build_attack(args).to(device)
     log.info(f"Channel attack: {attack}")
 
+    # Cifrar link gets its own attack instance: stateful attacks (replay,
+    # interleave) are filled with analog latents during optimisation.
+    secure_link, link_attack = None, None
+    if args.encrypt:
+        secure_link = SecureLatentLink(
+            seed=args.cipher_seed, quant_bits=args.quant_bits,
+            on_tamper=args.on_tamper, replay_check=args.replay_check,
+        )
+        link_attack = build_attack(args).to(device)
+        log.info(f"Secure link: {secure_link}")
+
     # Pre-compute the W-space mean once (expensive but amortised)
     log.info("Sampling latent mean (W-space average) …")
     with torch.no_grad():
@@ -639,6 +720,8 @@ def main():
             loader, latent_mean, percept, device,
             snr_db=snr_db,
             out_img_dir=snr_img_dir,
+            secure_link=secure_link,
+            link_attack=link_attack,
         )
         metrics["snr_db"] = snr_db
         all_results.append(metrics)
@@ -650,10 +733,14 @@ def main():
             f"SE={metrics['spectral_eff']:.3f} b/s/Hz | "
             f"Eff.SE={metrics['effective_se']:.4f}"
         )
+        if secure_link is not None:
+            log.info(f"  Cifrar: {secure_link.stats}")
 
     # ── save CSV ──────────────────────────────────────────────────────────────
     csv_path = out_dir / "metrics.csv"
     headers  = ["snr_db", "psnr", "ssim", "ber", "spectral_eff", "effective_se"]
+    if args.encrypt:
+        headers += SECURITY_KEYS
     with open(csv_path, "w") as f:
         f.write(",".join(headers) + "\n")
         for r in all_results:
@@ -680,10 +767,15 @@ def main():
     plot_ssim_vs_snr(snr_l, ssim_l,        out_dir, args.attack)
     plot_spectral_efficiency(snr_l, se_l, eff_l, out_dir, args.attack)
     plot_combined(snr_l, all_results,       out_dir, args.attack)
+    if args.encrypt:
+        plot_security_vs_snr(snr_l, all_results, out_dir, args.attack)
 
     # ── terminal summary table ────────────────────────────────────────────────
     col_w = [9, 10, 9, 11, 15, 12]
     hdr   = ["SNR (dB)", "PSNR (dB)", "MS-SSIM", "BER", "SE (b/s/Hz)", "Eff. SE"]
+    if args.encrypt:
+        col_w += [10, 11]
+        hdr   += ["Rejected", "Link BER"]
     sep   = "+" + "+".join("-" * w for w in col_w) + "+"
     fmt   = lambda vals: "|" + "|".join(
         f"{str(v):^{w}}" for v, w in zip(vals, col_w)
@@ -693,14 +785,17 @@ def main():
     print(fmt(hdr))
     print(sep)
     for r in all_results:
-        print(fmt([
+        row = [
             f"{r['snr_db']:+.0f}",
             f"{r['psnr']:.2f}",
             f"{r['ssim']:.4f}",
             f"{r['ber']:.2e}",
             f"{r['spectral_eff']:.3f}",
             f"{r['effective_se']:.4f}",
-        ]))
+        ]
+        if args.encrypt:
+            row += [f"{r['reject_rate']:.0%}", f"{r['link_ber']:.2e}"]
+        print(fmt(row))
     print(sep)
 
     log.info(f"\n[done] All outputs saved to: {out_dir}")
